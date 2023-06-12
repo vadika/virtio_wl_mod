@@ -13,6 +13,7 @@
  *  GNU General Public License for more details.
  *
  */
+
 /*
  * Virtio Wayland (virtio_wl or virtwl) is a virtual device that allows a guest
  * virtual machine to use a wayland server on the host transparently (to the
@@ -37,6 +38,7 @@
  * be possible to expose a unix stream socket from this driver, the user space
  * helper is much cleaner to write.
  */
+
 #include <linux/anon_inodes.h>
 #include <linux/cdev.h>
 #include <linux/compat.h>
@@ -56,33 +58,19 @@
 #include <linux/uaccess.h>
 #include <linux/virtio.h>
 #include <linux/virtio_dma_buf.h>
-#include "virtio_wl.h"
 #include <linux/vmalloc.h>
+#include "virtio_wl.h"
+
 #include <uapi/linux/dma-buf.h>
-#include "internal.h"
-/* #include "syscall.h" */
-
-/* extern int __close_fd(struct files_struct *files, unsigned int fd); */
-int __close_fd(struct files_struct *files, unsigned int fd)
-{return -1;}
-
-#if 0    /* TODO */
-int find_vm_area(struct vm_struct *vma)
-{return -1;}
-#endif
-
-static inline int ksys_close(unsigned int fd)
-{
-	return __close_fd(current->files, fd);
-}
-
-#define VIRTIO_WL_F_USE_SHMEM 3
 
 #ifdef CONFIG_DRM_VIRTIO_GPU
-
+#define SEND_VIRTGPU_RESOURCES
+#include <linux/sync_file.h>
 #endif
+
 #define VFD_ILLEGAL_SIGN_BIT 0x80000000
 #define VFD_HOST_VFD_ID_BIT 0x40000000
+
 struct virtwl_vfd_qentry {
 	struct list_head list;
 	struct virtio_wl_ctrl_hdr *hdr;
@@ -90,39 +78,46 @@ struct virtwl_vfd_qentry {
 	unsigned int vfd_offset; /* int offset into vfds */
 	unsigned int data_offset; /* byte offset into data */
 };
+
 struct virtwl_vfd {
 	struct kobject kobj;
 	struct mutex lock;
+
 	struct virtwl_info *vi;
 	uint32_t id;
 	uint32_t flags;
 	uint64_t pfn;
 	uint32_t size;
 	bool hungup;
+
 	struct list_head in_queue; /* list of virtwl_vfd_qentry */
 	wait_queue_head_t in_waitq;
 };
+
 struct virtwl_info {
 	dev_t dev_num;
 	struct device *dev;
 	struct class *class;
 	struct cdev cdev;
+
 	struct mutex vq_locks[VIRTWL_QUEUE_COUNT];
 	struct virtqueue *vqs[VIRTWL_QUEUE_COUNT];
 	struct work_struct in_vq_work;
 	struct work_struct out_vq_work;
+
 	wait_queue_head_t out_waitq;
+
 	struct mutex vfds_lock;
 	struct idr vfds;
+
 	bool use_send_vfd_v2;
-	// Base value to use when deriving pfn values from vfd pfn offsets
-	u64 pfn_base;
-	// Pfn value sent by the device to indicate the vfd has no pfn.
-	u64 invalid_pfn;
 };
+
 static struct virtwl_vfd *virtwl_vfd_alloc(struct virtwl_info *vi);
 static void virtwl_vfd_free(struct virtwl_vfd *vfd);
+
 static const struct file_operations virtwl_vfd_fops;
+
 static int virtwl_resp_err(unsigned int type)
 {
 	switch (type) {
@@ -146,18 +141,23 @@ static int virtwl_resp_err(unsigned int type)
 		return -EPROTO;
 	}
 }
+
 static int vq_return_inbuf_locked(struct virtqueue *vq, void *buffer)
 {
 	int ret;
 	struct scatterlist sg[1];
+
 	sg_init_one(sg, buffer, PAGE_SIZE);
+
 	ret = virtqueue_add_inbuf(vq, sg, 1, buffer, GFP_KERNEL);
 	if (ret) {
 		pr_warn("virtwl: failed to give inbuf to host: %d\n", ret);
 		return ret;
 	}
+
 	return 0;
 }
+
 static int vq_queue_out(struct virtwl_info *vi, struct scatterlist *out_sg,
 			struct scatterlist *in_sg,
 			struct completion *finish_completion,
@@ -167,6 +167,7 @@ static int vq_queue_out(struct virtwl_info *vi, struct scatterlist *out_sg,
 	struct mutex *vq_lock = &vi->vq_locks[VIRTWL_VQ_OUT];
 	struct scatterlist *sgs[] = { out_sg, in_sg };
 	int ret = 0;
+
 	mutex_lock(vq_lock);
 	while ((ret = virtqueue_add_sgs(vq, sgs, 1, 1, finish_completion,
 					GFP_KERNEL)) == -ENOSPC) {
@@ -180,113 +181,134 @@ static int vq_queue_out(struct virtwl_info *vi, struct scatterlist *out_sg,
 	if (!ret)
 		virtqueue_kick(vq);
 	mutex_unlock(vq_lock);
+
 	return ret;
 }
+
 static int vq_fill_locked(struct virtqueue *vq)
 {
 	void *buffer;
 	int ret = 0;
+
 	while (vq->num_free > 0) {
 		buffer = kmalloc(PAGE_SIZE, GFP_KERNEL);
 		if (!buffer) {
 			ret = -ENOMEM;
 			goto clear_queue;
 		}
+
 		ret = vq_return_inbuf_locked(vq, buffer);
 		if (ret)
 			goto clear_queue;
 	}
+
 	return 0;
+
 clear_queue:
 	while ((buffer = virtqueue_detach_unused_buf(vq)))
 		kfree(buffer);
 	return ret;
 }
-static uint64_t decode_pfn(struct virtwl_info *vi,
-			   struct virtio_wl_ctrl_vfd_new *new)
-{
-	if (new->pfn == vi->invalid_pfn)
-		return 0;
-	return new->pfn + vi->pfn_base;
-}
+
 static bool vq_handle_new(struct virtwl_info *vi,
 			  struct virtio_wl_ctrl_vfd_new *new, unsigned int len)
 {
 	struct virtwl_vfd *vfd;
 	u32 id = new->vfd_id;
 	int ret;
+
 	if (id == 0)
 		return true; /* return the inbuf to vq */
+
 	if (!(id & VFD_HOST_VFD_ID_BIT) || (id & VFD_ILLEGAL_SIGN_BIT)) {
 		pr_warn("virtwl: received a vfd with invalid id: %u\n", id);
 		return true; /* return the inbuf to vq */
 	}
+
 	vfd = virtwl_vfd_alloc(vi);
 	if (!vfd)
 		return true; /* return the inbuf to vq */
+
 	mutex_lock(&vi->vfds_lock);
 	ret = idr_alloc(&vi->vfds, vfd, id, id + 1, GFP_KERNEL);
 	mutex_unlock(&vi->vfds_lock);
+
 	if (ret <= 0) {
 		virtwl_vfd_free(vfd);
 		pr_warn("virtwl: failed to place received vfd: %d\n", ret);
 		return true; /* return the inbuf to vq */
 	}
+
 	vfd->id = id;
 	vfd->size = new->size;
-	vfd->pfn = decode_pfn(vi, new);
+	vfd->pfn = new->pfn;
 	vfd->flags = new->flags;
+
 	return true; /* return the inbuf to vq */
 }
+
 static bool vq_handle_recv(struct virtwl_info *vi,
 			   struct virtio_wl_ctrl_vfd_recv *recv,
 			   unsigned int len)
 {
 	struct virtwl_vfd *vfd;
 	struct virtwl_vfd_qentry *qentry;
+
 	mutex_lock(&vi->vfds_lock);
 	vfd = idr_find(&vi->vfds, recv->vfd_id);
 	if (vfd)
 		mutex_lock(&vfd->lock);
 	mutex_unlock(&vi->vfds_lock);
+
 	if (!vfd) {
 		pr_warn("virtwl: recv for unknown vfd_id %u\n", recv->vfd_id);
 		return true; /* return the inbuf to vq */
 	}
+
 	qentry = kzalloc(sizeof(*qentry), GFP_KERNEL);
 	if (!qentry) {
 		mutex_unlock(&vfd->lock);
 		pr_warn("virtwl: failed to allocate qentry for vfd\n");
 		return true; /* return the inbuf to vq */
 	}
+
 	qentry->hdr = &recv->hdr;
 	qentry->len = len;
+
 	list_add_tail(&qentry->list, &vfd->in_queue);
 	wake_up_interruptible_all(&vfd->in_waitq);
 	mutex_unlock(&vfd->lock);
+
 	return false; /* no return the inbuf to vq */
 }
+
 static bool vq_handle_hup(struct virtwl_info *vi,
 			   struct virtio_wl_ctrl_vfd *vfd_hup,
 			   unsigned int len)
 {
 	struct virtwl_vfd *vfd;
+
 	mutex_lock(&vi->vfds_lock);
 	vfd = idr_find(&vi->vfds, vfd_hup->vfd_id);
 	if (vfd)
 		mutex_lock(&vfd->lock);
 	mutex_unlock(&vi->vfds_lock);
+
 	if (!vfd) {
 		pr_warn("virtwl: hup for unknown vfd_id %u\n", vfd_hup->vfd_id);
 		return true; /* return the inbuf to vq */
 	}
+
 	if (vfd->hungup)
 		pr_warn("virtwl: hup for hungup vfd_id %u\n", vfd_hup->vfd_id);
+
 	vfd->hungup = true;
 	wake_up_interruptible_all(&vfd->in_waitq);
 	mutex_unlock(&vfd->lock);
+
 	return true;
 }
+
 static bool vq_dispatch_hdr(struct virtwl_info *vi, unsigned int len,
 			    struct virtio_wl_ctrl_hdr *hdr)
 {
@@ -294,6 +316,7 @@ static bool vq_dispatch_hdr(struct virtwl_info *vi, unsigned int len,
 	struct mutex *vq_lock = &vi->vq_locks[VIRTWL_VQ_IN];
 	bool return_vq = true;
 	int ret;
+
 	switch (hdr->type) {
 	case VIRTIO_WL_CMD_VFD_NEW:
 		return_vq = vq_handle_new(vi,
@@ -312,8 +335,10 @@ static bool vq_dispatch_hdr(struct virtwl_info *vi, unsigned int len,
 		pr_warn("virtwl: unhandled ctrl command: %u\n", hdr->type);
 		break;
 	}
+
 	if (!return_vq)
 		return false; /* no kick the vq */
+
 	mutex_lock(vq_lock);
 	ret = vq_return_inbuf_locked(vq, hdr);
 	mutex_unlock(vq_lock);
@@ -321,8 +346,10 @@ static bool vq_dispatch_hdr(struct virtwl_info *vi, unsigned int len,
 		pr_warn("virtwl: failed to return inbuf to host: %d\n", ret);
 		kfree(hdr);
 	}
+
 	return true; /* kick the vq */
 }
+
 static void vq_in_work_handler(struct work_struct *work)
 {
 	struct virtwl_info *vi = container_of(work, struct virtwl_info,
@@ -332,17 +359,21 @@ static void vq_in_work_handler(struct work_struct *work)
 	void *buffer;
 	unsigned int len;
 	bool kick_vq = false;
+
 	mutex_lock(vq_lock);
 	while ((buffer = virtqueue_get_buf(vq, &len)) != NULL) {
 		struct virtio_wl_ctrl_hdr *hdr = buffer;
+
 		mutex_unlock(vq_lock);
 		kick_vq |= vq_dispatch_hdr(vi, len, hdr);
 		mutex_lock(vq_lock);
 	}
 	mutex_unlock(vq_lock);
+
 	if (kick_vq)
 		virtqueue_kick(vq);
 }
+
 static void vq_out_work_handler(struct work_struct *work)
 {
 	struct virtwl_info *vi = container_of(work, struct virtwl_info,
@@ -352,40 +383,53 @@ static void vq_out_work_handler(struct work_struct *work)
 	unsigned int len;
 	struct completion *finish_completion;
 	bool wake_waitq = false;
+
 	mutex_lock(vq_lock);
 	while ((finish_completion = virtqueue_get_buf(vq, &len)) != NULL) {
 		wake_waitq = true;
 		complete(finish_completion);
 	}
 	mutex_unlock(vq_lock);
+
 	if (wake_waitq)
 		wake_up_interruptible_all(&vi->out_waitq);
 }
+
 static void vq_in_cb(struct virtqueue *vq)
 {
 	struct virtwl_info *vi = vq->vdev->priv;
+
 	schedule_work(&vi->in_vq_work);
 }
+
 static void vq_out_cb(struct virtqueue *vq)
 {
 	struct virtwl_info *vi = vq->vdev->priv;
+
 	schedule_work(&vi->out_vq_work);
 }
+
 static struct virtwl_vfd *virtwl_vfd_alloc(struct virtwl_info *vi)
 {
 	struct virtwl_vfd *vfd = kzalloc(sizeof(struct virtwl_vfd), GFP_KERNEL);
+
 	if (!vfd)
 		return ERR_PTR(-ENOMEM);
+
 	vfd->vi = vi;
+
 	mutex_init(&vfd->lock);
 	INIT_LIST_HEAD(&vfd->in_queue);
 	init_waitqueue_head(&vfd->in_waitq);
+
 	return vfd;
 }
+
 static int virtwl_vfd_file_flags(struct virtwl_vfd *vfd)
 {
 	int flags = 0;
 	int rw_mask = VIRTIO_WL_VFD_WRITE | VIRTIO_WL_VFD_READ;
+
 	if ((vfd->flags & rw_mask) == rw_mask)
 		flags |= O_RDWR;
 	else if (vfd->flags & VIRTIO_WL_VFD_WRITE)
@@ -396,10 +440,12 @@ static int virtwl_vfd_file_flags(struct virtwl_vfd *vfd)
 		flags |= O_RDWR;
 	return flags;
 }
+
 /* Locks the vfd and unlinks its id from vi */
 static void virtwl_vfd_lock_unlink(struct virtwl_vfd *vfd)
 {
 	struct virtwl_info *vi = vfd->vi;
+
 	/* this order is important to avoid deadlock */
 	mutex_lock(&vi->vfds_lock);
 	mutex_lock(&vfd->lock);
@@ -407,6 +453,7 @@ static void virtwl_vfd_lock_unlink(struct virtwl_vfd *vfd)
 	mutex_unlock(&vfd->lock);
 	mutex_unlock(&vi->vfds_lock);
 }
+
 /*
  * Only used to free a vfd that is not referenced any place else and contains
  * no queed virtio buffers. This must not be called while vfd is included in a
@@ -416,6 +463,7 @@ static void virtwl_vfd_free(struct virtwl_vfd *vfd)
 {
 	kfree(vfd);
 }
+
 /*
  * Thread safe and also removes vfd from vi as well as any queued virtio buffers
  */
@@ -425,7 +473,9 @@ static void virtwl_vfd_remove(struct virtwl_vfd *vfd)
 	struct virtqueue *vq = vi->vqs[VIRTWL_VQ_IN];
 	struct mutex *vq_lock = &vi->vq_locks[VIRTWL_VQ_IN];
 	struct virtwl_vfd_qentry *qentry, *next;
+
 	virtwl_vfd_lock_unlink(vfd);
+
 	mutex_lock(vq_lock);
 	list_for_each_entry_safe(qentry, next, &vfd->in_queue, list) {
 		vq_return_inbuf_locked(vq, qentry->hdr);
@@ -434,25 +484,31 @@ static void virtwl_vfd_remove(struct virtwl_vfd *vfd)
 	}
 	mutex_unlock(vq_lock);
 	virtqueue_kick(vq);
+
 	virtwl_vfd_free(vfd);
 }
+
 static void vfd_qentry_free_if_empty(struct virtwl_vfd *vfd,
 				     struct virtwl_vfd_qentry *qentry)
 {
 	struct virtwl_info *vi = vfd->vi;
 	struct virtqueue *vq = vi->vqs[VIRTWL_VQ_IN];
 	struct mutex *vq_lock = &vi->vq_locks[VIRTWL_VQ_IN];
+
 	if (qentry->hdr->type == VIRTIO_WL_CMD_VFD_RECV) {
 		struct virtio_wl_ctrl_vfd_recv *recv =
 			(struct virtio_wl_ctrl_vfd_recv *)qentry->hdr;
 		ssize_t data_len =
 			(ssize_t)qentry->len - (ssize_t)sizeof(*recv) -
 			(ssize_t)recv->vfd_count * (ssize_t)sizeof(__le32);
+
 		if (qentry->vfd_offset < recv->vfd_count)
 			return;
+
 		if ((s64)qentry->data_offset < data_len)
 			return;
 	}
+
 	mutex_lock(vq_lock);
 	vq_return_inbuf_locked(vq, qentry->hdr);
 	mutex_unlock(vq_lock);
@@ -460,34 +516,46 @@ static void vfd_qentry_free_if_empty(struct virtwl_vfd *vfd,
 	kfree(qentry);
 	virtqueue_kick(vq);
 }
+
 static ssize_t vfd_out_locked(struct virtwl_vfd *vfd, char __user *buffer,
 			      size_t len)
 {
 	struct virtwl_vfd_qentry *qentry, *next;
-	ssize_t read_count = 0;
+	size_t read_count = 0;
+
 	list_for_each_entry_safe(qentry, next, &vfd->in_queue, list) {
 		struct virtio_wl_ctrl_vfd_recv *recv =
 			(struct virtio_wl_ctrl_vfd_recv *)qentry->hdr;
 		size_t recv_offset = sizeof(*recv) + recv->vfd_count *
 				     sizeof(__le32) + qentry->data_offset;
 		u8 *buf = (u8 *)recv + recv_offset;
-		ssize_t to_read = (ssize_t)qentry->len - (ssize_t)recv_offset;
+		size_t to_read = (size_t)qentry->len - recv_offset;
+
+		/* Detect underflow caused by invalid recv->vfd_count value. */
+		if (to_read > (size_t)qentry->len)
+			return -EIO;
+
 		if (qentry->hdr->type != VIRTIO_WL_CMD_VFD_RECV)
 			continue;
-		if ((to_read + read_count) > len)
+
+		if (len - read_count < to_read)
 			to_read = len - read_count;
-		if (copy_to_user(buffer + read_count, buf, to_read)) {
-			read_count = -EFAULT;
-			break;
-		}
+
+		if (copy_to_user(buffer + read_count, buf, to_read))
+			return -EFAULT;
+
 		read_count += to_read;
+
 		qentry->data_offset += to_read;
 		vfd_qentry_free_if_empty(vfd, qentry);
+
 		if (read_count >= len)
 			break;
 	}
+
 	return read_count;
 }
+
 /* must hold both vfd->lock and vi->vfds_lock */
 static size_t vfd_out_vfds_locked(struct virtwl_vfd *vfd,
 				  struct virtwl_vfd **vfds, size_t count)
@@ -496,6 +564,7 @@ static size_t vfd_out_vfds_locked(struct virtwl_vfd *vfd,
 	struct virtwl_vfd_qentry *qentry, *next;
 	size_t i;
 	size_t read_count = 0;
+
 	list_for_each_entry_safe(qentry, next, &vfd->in_queue, list) {
 		struct virtio_wl_ctrl_vfd_recv *recv =
 			(struct virtio_wl_ctrl_vfd_recv *)qentry->hdr;
@@ -503,14 +572,17 @@ static size_t vfd_out_vfds_locked(struct virtwl_vfd *vfd,
 				    sizeof(__le32);
 		__le32 *vfds_le = (__le32 *)((void *)recv + vfd_offset);
 		ssize_t vfds_to_read = recv->vfd_count - qentry->vfd_offset;
+
 		if (read_count >= count)
 			break;
 		if (vfds_to_read <= 0)
 			continue;
 		if (qentry->hdr->type != VIRTIO_WL_CMD_VFD_RECV)
 			continue;
+
 		if ((vfds_to_read + read_count) > count)
 			vfds_to_read = count - read_count;
+
 		for (i = 0; i < vfds_to_read; i++) {
 			uint32_t vfd_id = le32_to_cpu(vfds_le[i]);
 			vfds[read_count] = idr_find(&vi->vfds, vfd_id);
@@ -522,10 +594,13 @@ static size_t vfd_out_vfds_locked(struct virtwl_vfd *vfd,
 			}
 			qentry->vfd_offset++;
 		}
+
 		vfd_qentry_free_if_empty(vfd, qentry);
 	}
+
 	return read_count;
 }
+
 /* this can only be called if the caller has unique ownership of the vfd */
 static int do_vfd_close(struct virtwl_vfd *vfd)
 {
@@ -535,15 +610,19 @@ static int do_vfd_close(struct virtwl_vfd *vfd)
 	struct scatterlist out_sg;
 	struct scatterlist in_sg;
 	int ret = 0;
+
 	ctrl_close = kzalloc(sizeof(*ctrl_close), GFP_KERNEL);
 	if (!ctrl_close)
 		return -ENOMEM;
+
 	ctrl_close->hdr.type = VIRTIO_WL_CMD_VFD_CLOSE;
 	ctrl_close->vfd_id = vfd->id;
+
 	sg_init_one(&out_sg, &ctrl_close->hdr,
 		    sizeof(struct virtio_wl_ctrl_vfd));
 	sg_init_one(&in_sg, &ctrl_close->hdr,
 		    sizeof(struct virtio_wl_ctrl_hdr));
+
 	init_completion(&finish_completion);
 	ret = vq_queue_out(vi, &out_sg, &in_sg, &finish_completion,
 			   false /* block */);
@@ -553,12 +632,15 @@ static int do_vfd_close(struct virtwl_vfd *vfd)
 			ret);
 		goto free_ctrl_close;
 	}
+
 	wait_for_completion(&finish_completion);
 	virtwl_vfd_remove(vfd);
+
 free_ctrl_close:
 	kfree(ctrl_close);
 	return ret;
 }
+
 static ssize_t virtwl_vfd_recv(struct file *filp, char __user *buffer,
 			       size_t len, struct virtwl_vfd **vfds,
 			       size_t *vfd_count)
@@ -568,23 +650,29 @@ static ssize_t virtwl_vfd_recv(struct file *filp, char __user *buffer,
 	ssize_t read_count = 0;
 	size_t vfd_read_count = 0;
 	bool force_to_wait = false;
+
 	mutex_lock(&vi->vfds_lock);
 	mutex_lock(&vfd->lock);
+
 	while (read_count == 0 && vfd_read_count == 0) {
 		while (force_to_wait || list_empty(&vfd->in_queue)) {
 			force_to_wait = false;
 			if (vfd->hungup)
 				goto out_unlock;
+
 			mutex_unlock(&vfd->lock);
 			mutex_unlock(&vi->vfds_lock);
 			if (filp->f_flags & O_NONBLOCK)
 				return -EAGAIN;
+
 			if (wait_event_interruptible(vfd->in_waitq,
 				!list_empty(&vfd->in_queue) || vfd->hungup))
 				return -ERESTARTSYS;
+
 			mutex_lock(&vi->vfds_lock);
 			mutex_lock(&vfd->lock);
 		}
+
 		read_count = vfd_out_locked(vfd, buffer, len);
 		if (read_count < 0)
 			goto out_unlock;
@@ -600,6 +688,7 @@ static ssize_t virtwl_vfd_recv(struct file *filp, char __user *buffer,
 			 */
 			force_to_wait = true;
 	}
+
 out_unlock:
 	mutex_unlock(&vfd->lock);
 	mutex_unlock(&vi->vfds_lock);
@@ -607,10 +696,12 @@ out_unlock:
 		*vfd_count = vfd_read_count;
 	return read_count;
 }
+
 static int encode_vfd_ids(struct virtwl_vfd **vfds, size_t vfd_count,
 			  __le32 *vfd_ids)
 {
 	size_t i;
+
 	for (i = 0; i < vfd_count; i++) {
 		if (vfds[i])
 			vfd_ids[i] = cpu_to_le32(vfds[i]->id);
@@ -619,24 +710,30 @@ static int encode_vfd_ids(struct virtwl_vfd **vfds, size_t vfd_count,
 	}
 	return 0;
 }
+
 #ifdef SEND_VIRTGPU_RESOURCES
 static int get_dma_buf_id(struct dma_buf *dma_buf, u32 *id)
 {
 	uuid_t uuid;
 	int ret = 0;
+
 	ret = virtio_dma_buf_get_uuid(dma_buf, &uuid);
 	*id = be32_to_cpu(*(__be32 *)(uuid.b + 12));
+
 	return ret;
 }
+
 static int encode_fence(struct dma_fence *fence,
 			struct virtio_wl_ctrl_vfd_send_vfd_v2 *vfd_id)
 {
 	const char *name = fence->ops->get_driver_name(fence);
+
 	// We only support virtgpu based fences. Since all virtgpu fences are
 	// in the same context, merging sync_files will always reduce to a
 	// single virtgpu fence.
 	if (strcmp(name, "virtio_gpu") != 0)
 		return -EBADFD;
+
 	if (dma_fence_is_signaled(fence)) {
 		vfd_id->kind =
 			VIRTIO_WL_CTRL_VFD_SEND_KIND_VIRTGPU_SIGNALED_FENCE;
@@ -646,6 +743,7 @@ static int encode_fence(struct dma_fence *fence,
 	}
 	return 0;
 }
+
 static int encode_vfd_ids_foreign(struct virtwl_vfd **vfds,
 				  struct dma_buf **virtgpu_dma_bufs,
 				  struct dma_fence **virtgpu_dma_fence,
@@ -655,9 +753,11 @@ static int encode_vfd_ids_foreign(struct virtwl_vfd **vfds,
 {
 	size_t i;
 	int ret;
+
 	for (i = 0; i < vfd_count; i++) {
 		uint32_t kind = UINT_MAX;
 		uint32_t id = 0;
+
 		if (vfds[i]) {
 			kind = VIRTIO_WL_CTRL_VFD_SEND_KIND_LOCAL;
 			id = vfds[i]->id;
@@ -688,6 +788,7 @@ static int encode_vfd_ids_foreign(struct virtwl_vfd **vfds,
 	return 0;
 }
 #endif
+
 static int virtwl_vfd_send(struct file *filp, const char __user *buffer,
 					       u32 len, int *vfd_fds)
 {
@@ -714,30 +815,37 @@ static int virtwl_vfd_send(struct file *filp, const char __user *buffer,
 	bool vmalloced;
 	int ret;
 	int i;
+
 	if (vfd_fds) {
 		for (i = 0; i < VIRTWL_SEND_MAX_ALLOCS; i++) {
 			struct fd vfd_file;
 			int fd = vfd_fds[i];
+
 			if (fd < 0)
 				break;
+
 			vfd_file = fdget(vfd_fds[i]);
 			if (!vfd_file.file) {
 				ret = -EBADFD;
 				goto put_files;
 			}
+
 			if (vfd_file.file->f_op == &virtwl_vfd_fops) {
 				vfd_files[i] = vfd_file;
+
 				vfds[i] = vfd_file.file->private_data;
 				if (vfds[i] && vfds[i]->id) {
 					vfd_count++;
 					continue;
 				}
+
 				ret = -EINVAL;
 				goto put_files;
 			} else {
 				struct dma_buf *dma_buf = ERR_PTR(-EINVAL);
 				struct dma_fence *dma_fence = ERR_PTR(-EINVAL);
 				bool handled = false;
+
 #ifdef SEND_VIRTGPU_RESOURCES
 				dma_buf = dma_buf_get(vfd_fds[i]);
 				dma_fence = vi->use_send_vfd_v2
@@ -745,11 +853,13 @@ static int virtwl_vfd_send(struct file *filp, const char __user *buffer,
 					: ERR_PTR(-EINVAL);
 				handled = !IS_ERR(dma_buf) ||
 					  !IS_ERR(dma_fence);
+
 				if (!IS_ERR(dma_buf)) {
 					virtgpu_dma_bufs[i] = dma_buf;
 				} else {
 					virtgpu_dma_fence[i] = dma_fence;
 				}
+
 				foreign_id = true;
 				vfd_count++;
 #endif
@@ -763,9 +873,11 @@ static int virtwl_vfd_send(struct file *filp, const char __user *buffer,
 			}
 		}
 	}
+
 	/* Empty writes always succeed. */
 	if (len == 0 && vfd_count == 0)
 		return 0;
+
 	vfd_ids_size = vfd_count * sizeof(__le32);
 #ifdef SEND_VIRTGPU_RESOURCES
 	if (foreign_id) {
@@ -786,18 +898,22 @@ static int virtwl_vfd_send(struct file *filp, const char __user *buffer,
 		ret = -ENOMEM;
 		goto put_files;
 	}
+
 	vfd_ids = (u8 *)ctrl_send + sizeof(*ctrl_send);
 	out_buffer = (u8 *)ctrl_send + ctrl_send_size - len;
+
 	ctrl_send->hdr.type = VIRTIO_WL_CMD_VFD_SEND;
 	ctrl_send->hdr.flags = 0;
 #ifdef SEND_VIRTGPU_RESOURCES
 	if (foreign_id) {
 		struct virtio_wl_ctrl_vfd_send_vfd *v1 = NULL;
 		struct virtio_wl_ctrl_vfd_send_vfd_v2 *v2 = NULL;
+
 		if (vi->use_send_vfd_v2)
 			v2 = (struct virtio_wl_ctrl_vfd_send_vfd_v2 *) vfd_ids;
 		else
 			v1 = (struct virtio_wl_ctrl_vfd_send_vfd *) vfd_ids;
+
 		ctrl_send->hdr.type = VIRTIO_WL_CMD_VFD_SEND_FOREIGN_ID;
 		ret = encode_vfd_ids_foreign(vfds,
 			virtgpu_dma_bufs, virtgpu_dma_fence, vfd_count,
@@ -812,10 +928,12 @@ static int virtwl_vfd_send(struct file *filp, const char __user *buffer,
 		goto free_ctrl_send;
 	ctrl_send->vfd_id = vfd->id;
 	ctrl_send->vfd_count = vfd_count;
+
 	if (copy_from_user(out_buffer, buffer, len)) {
 		ret = -EFAULT;
 		goto free_ctrl_send;
 	}
+
 	init_completion(&finish_completion);
 	if (!vmalloced) {
 		sg_init_one(&out_sg, ctrl_send, ctrl_send_size);
@@ -824,23 +942,26 @@ static int virtwl_vfd_send(struct file *filp, const char __user *buffer,
 		ret = vq_queue_out(vi, &out_sg, &in_sg, &finish_completion,
 		    filp->f_flags & O_NONBLOCK);
 	} else {
-		#if 0  /* TODO */
 		area = find_vm_area(ctrl_send);
-		#endif
 		ret = sg_alloc_table_from_pages(&sgt, area->pages,
 		    area->nr_pages, 0, ctrl_send_size, GFP_KERNEL);
 		if (ret)
 			goto free_ctrl_send;
+
 		sg_init_table(&in_sg, 1);
 		sg_set_page(&in_sg, area->pages[0],
 		    sizeof(struct virtio_wl_ctrl_hdr), 0);
+
 		ret = vq_queue_out(vi, sgt.sgl, &in_sg, &finish_completion,
 		    filp->f_flags & O_NONBLOCK);
 	}
 	if (ret)
 		goto free_sgt;
+
 	wait_for_completion(&finish_completion);
+
 	ret = virtwl_resp_err(ctrl_send->hdr.type);
+
 free_sgt:
 	if (vmalloced)
 		sg_free_table(&sgt);
@@ -859,6 +980,7 @@ put_files:
 	}
 	return ret;
 }
+
 static int virtwl_vfd_dmabuf_sync(struct file *filp, u32 flags)
 {
 	struct virtio_wl_ctrl_vfd_dmabuf_sync *ctrl_dmabuf_sync;
@@ -868,16 +990,20 @@ static int virtwl_vfd_dmabuf_sync(struct file *filp, u32 flags)
 	struct scatterlist out_sg;
 	struct scatterlist in_sg;
 	int ret = 0;
+
 	ctrl_dmabuf_sync = kzalloc(sizeof(*ctrl_dmabuf_sync), GFP_KERNEL);
 	if (!ctrl_dmabuf_sync)
 		return -ENOMEM;
+
 	ctrl_dmabuf_sync->hdr.type = VIRTIO_WL_CMD_VFD_DMABUF_SYNC;
 	ctrl_dmabuf_sync->vfd_id = vfd->id;
 	ctrl_dmabuf_sync->flags = flags;
+
 	sg_init_one(&out_sg, &ctrl_dmabuf_sync->hdr,
 		    sizeof(struct virtio_wl_ctrl_vfd_dmabuf_sync));
 	sg_init_one(&in_sg, &ctrl_dmabuf_sync->hdr,
 		    sizeof(struct virtio_wl_ctrl_hdr));
+
 	init_completion(&finish_completion);
 	ret = vq_queue_out(vi, &out_sg, &in_sg, &finish_completion,
 			   false /* block */);
@@ -887,64 +1013,79 @@ static int virtwl_vfd_dmabuf_sync(struct file *filp, u32 flags)
 			ret);
 		goto free_ctrl_dmabuf_sync;
 	}
+
 	wait_for_completion(&finish_completion);
+
 free_ctrl_dmabuf_sync:
 	kfree(ctrl_dmabuf_sync);
 	return ret;
 }
+
 static ssize_t virtwl_vfd_read(struct file *filp, char __user *buffer,
 			       size_t size, loff_t *pos)
 {
 	return virtwl_vfd_recv(filp, buffer, size, NULL, NULL);
 }
+
 static ssize_t virtwl_vfd_write(struct file *filp, const char __user *buffer,
 				size_t size, loff_t *pos)
 {
 	int ret = 0;
+
 	if (size > U32_MAX)
 		size = U32_MAX;
+
 	ret = virtwl_vfd_send(filp, buffer, size, NULL);
 	if (ret)
 		return ret;
+
 	return size;
 }
+
 static int virtwl_vfd_mmap(struct file *filp, struct vm_area_struct *vma)
 {
 	struct virtwl_vfd *vfd = filp->private_data;
 	unsigned long vm_size = vma->vm_end - vma->vm_start;
 	int ret = 0;
+
 	mutex_lock(&vfd->lock);
+
 	if (!vfd->pfn) {
 		ret = -EACCES;
 		goto out_unlock;
 	}
+
 	if (vm_size + (vma->vm_pgoff << PAGE_SHIFT) > PAGE_ALIGN(vfd->size)) {
 		ret = -EINVAL;
 		goto out_unlock;
 	}
+
 	ret = io_remap_pfn_range(vma, vma->vm_start, vfd->pfn, vm_size,
 				 vma->vm_page_prot);
 	if (ret)
 		goto out_unlock;
 #if 0
 	vma->vm_flags |= VM_PFNMAP | VM_IO | VM_DONTEXPAND | VM_DONTDUMP;
-#endif
+#endif 
 
 out_unlock:
 	mutex_unlock(&vfd->lock);
 	return ret;
 }
+
 static unsigned int virtwl_vfd_poll(struct file *filp,
 				    struct poll_table_struct *wait)
 {
 	struct virtwl_vfd *vfd = filp->private_data;
 	struct virtwl_info *vi = vfd->vi;
 	unsigned int mask = 0;
+
 	mutex_lock(&vi->vq_locks[VIRTWL_VQ_OUT]);
 	poll_wait(filp, &vi->out_waitq, wait);
 	if (vi->vqs[VIRTWL_VQ_OUT]->num_free)
 		mask |= POLLOUT | POLLWRNORM;
 	mutex_unlock(&vi->vq_locks[VIRTWL_VQ_OUT]);
+
 	mutex_lock(&vfd->lock);
 	poll_wait(filp, &vfd->in_waitq, wait);
 	if (!list_empty(&vfd->in_queue))
@@ -952,13 +1093,16 @@ static unsigned int virtwl_vfd_poll(struct file *filp,
 	if (vfd->hungup)
 		mask |= POLLHUP;
 	mutex_unlock(&vfd->lock);
+
 	return mask;
 }
+
 static int virtwl_vfd_release(struct inode *inodep, struct file *filp)
 {
 	struct virtwl_vfd *vfd = filp->private_data;
 	uint32_t vfd_id = vfd->id;
 	int ret;
+
 	/*
 	 * If release is called, filp must be out of references and we have the
 	 * last reference.
@@ -969,13 +1113,17 @@ static int virtwl_vfd_release(struct inode *inodep, struct file *filp)
 			ret);
 	return 0;
 }
+
 static int virtwl_open(struct inode *inodep, struct file *filp)
 {
 	struct virtwl_info *vi = container_of(inodep->i_cdev,
 					      struct virtwl_info, cdev);
+
 	filp->private_data = vi;
+
 	return 0;
 }
+
 static struct virtwl_vfd *do_new(struct virtwl_info *vi,
 				 struct virtwl_ioctl_new *ioctl_new,
 				 size_t ioctl_new_size, bool nonblock)
@@ -986,6 +1134,7 @@ static struct virtwl_vfd *do_new(struct virtwl_info *vi,
 	struct scatterlist out_sg;
 	struct scatterlist in_sg;
 	int ret = 0;
+
 	if (ioctl_new->type != VIRTWL_IOCTL_NEW_CTX &&
 		ioctl_new->type != VIRTWL_IOCTL_NEW_CTX_NAMED &&
 		ioctl_new->type != VIRTWL_IOCTL_NEW_ALLOC &&
@@ -993,14 +1142,17 @@ static struct virtwl_vfd *do_new(struct virtwl_info *vi,
 		ioctl_new->type != VIRTWL_IOCTL_NEW_PIPE_WRITE &&
 		ioctl_new->type != VIRTWL_IOCTL_NEW_DMABUF)
 		return ERR_PTR(-EINVAL);
+
 	ctrl_new = kzalloc(sizeof(*ctrl_new), GFP_KERNEL);
 	if (!ctrl_new)
 		return ERR_PTR(-ENOMEM);
+
 	vfd = virtwl_vfd_alloc(vi);
 	if (!vfd) {
 		ret = -ENOMEM;
 		goto free_ctrl_new;
 	}
+
 	mutex_lock(&vi->vfds_lock);
 	/*
 	 * Take the lock before adding it to the vfds list where others might
@@ -1011,8 +1163,10 @@ static struct virtwl_vfd *do_new(struct virtwl_info *vi,
 	mutex_unlock(&vi->vfds_lock);
 	if (ret <= 0)
 		goto remove_vfd;
+
 	vfd->id = ret;
 	ret = 0;
+
 	ctrl_new->vfd_id = vfd->id;
 	switch (ioctl_new->type) {
 	case VIRTWL_IOCTL_NEW_CTX:
@@ -1050,27 +1204,36 @@ static struct virtwl_vfd *do_new(struct virtwl_info *vi,
 		ret = -EINVAL;
 		goto remove_vfd;
 	}
+
 	init_completion(&finish_completion);
 	sg_init_one(&out_sg, ctrl_new, sizeof(*ctrl_new));
 	sg_init_one(&in_sg, ctrl_new, sizeof(*ctrl_new));
+
 	ret = vq_queue_out(vi, &out_sg, &in_sg, &finish_completion, nonblock);
 	if (ret)
 		goto remove_vfd;
+
 	wait_for_completion(&finish_completion);
+
 	ret = virtwl_resp_err(ctrl_new->hdr.type);
 	if (ret)
 		goto remove_vfd;
+
 	vfd->size = ctrl_new->size;
-	vfd->pfn = decode_pfn(vi, ctrl_new);
+	vfd->pfn = ctrl_new->pfn;
 	vfd->flags = ctrl_new->flags;
+
 	mutex_unlock(&vfd->lock);
+
 	if (ioctl_new->type == VIRTWL_IOCTL_NEW_DMABUF) {
 		/* FIXME: convert to host byte order. */
 		memcpy(&ioctl_new->dmabuf, &ctrl_new->dmabuf,
 		       sizeof(ctrl_new->dmabuf));
 	}
+
 	kfree(ctrl_new);
 	return vfd;
+
 remove_vfd:
 	/*
 	 * unlock the vfd to avoid deadlock when unlinking it
@@ -1085,20 +1248,25 @@ free_ctrl_new:
 	kfree(ctrl_new);
 	return ERR_PTR(ret);
 }
+
 static long virtwl_ioctl_send(struct file *filp, void __user *ptr)
 {
 	struct virtwl_ioctl_txn ioctl_send;
 	void __user *user_data = ptr + sizeof(struct virtwl_ioctl_txn);
 	int ret;
+
 	ret = copy_from_user(&ioctl_send, ptr, sizeof(struct virtwl_ioctl_txn));
 	if (ret)
 		return -EFAULT;
+
 	/* Early check for user error; do_send still uses copy_from_user. */
 	ret = !access_ok(user_data, ioctl_send.len);
 	if (ret)
 		return -EFAULT;
+
 	return virtwl_vfd_send(filp, user_data, ioctl_send.len, ioctl_send.fds);
 }
+
 static long virtwl_ioctl_recv(struct file *filp, void __user *ptr)
 {
 	struct virtwl_ioctl_txn ioctl_recv;
@@ -1109,61 +1277,76 @@ static long virtwl_ioctl_recv(struct file *filp, void __user *ptr)
 	int fds[VIRTWL_SEND_MAX_ALLOCS];
 	size_t i;
 	int ret = 0;
+
 	for (i = 0; i < VIRTWL_SEND_MAX_ALLOCS; i++)
 		fds[i] = -1;
+
 	ret = copy_from_user(&ioctl_recv, ptr, sizeof(struct virtwl_ioctl_txn));
 	if (ret)
 		return -EFAULT;
+
 	/* Early check for user error. */
 	ret = !access_ok(user_data, ioctl_recv.len);
 	if (ret)
 		return -EFAULT;
+
 	ret = virtwl_vfd_recv(filp, user_data, ioctl_recv.len, vfds,
 			      &vfd_count);
 	if (ret < 0)
 		return ret;
+
 	ret = copy_to_user(&((struct virtwl_ioctl_txn __user *)ptr)->len, &ret,
 			   sizeof(ioctl_recv.len));
 	if (ret) {
 		ret = -EFAULT;
 		goto free_vfds;
 	}
+
 	for (i = 0; i < vfd_count; i++) {
 		ret = anon_inode_getfd("[virtwl_vfd]", &virtwl_vfd_fops,
 				       vfds[i], virtwl_vfd_file_flags(vfds[i])
 				       | O_CLOEXEC);
 		if (ret < 0)
 			goto free_vfds;
+
 		vfds[i] = NULL;
 		fds[i] = ret;
 	}
+
 	ret = copy_to_user(user_fds, fds, sizeof(int) * VIRTWL_SEND_MAX_ALLOCS);
 	if (ret) {
 		ret = -EFAULT;
 		goto free_vfds;
 	}
+
 	return 0;
+
 free_vfds:
 	for (i = 0; i < vfd_count; i++) {
 		if (vfds[i])
 			do_vfd_close(vfds[i]);
 		if (fds[i] >= 0)
-			__close_fd(current->files, fds[i]);
+			close_fd(fds[i]);
 	}
 	return ret;
 }
+
 static long virtwl_ioctl_dmabuf_sync(struct file *filp, void __user *ptr)
 {
 	struct virtwl_ioctl_dmabuf_sync ioctl_dmabuf_sync;
 	int ret;
+
 	ret = copy_from_user(&ioctl_dmabuf_sync, ptr,
 			     sizeof(struct virtwl_ioctl_dmabuf_sync));
 	if (ret)
 		return -EFAULT;
+
 	if (ioctl_dmabuf_sync.flags & ~DMA_BUF_SYNC_VALID_FLAGS_MASK)
 		return -EINVAL;
+
 	return virtwl_vfd_dmabuf_sync(filp, ioctl_dmabuf_sync.flags);
 }
+
 static long virtwl_vfd_ioctl(struct file *filp, unsigned int cmd,
 			     void __user *ptr)
 {
@@ -1178,6 +1361,7 @@ static long virtwl_vfd_ioctl(struct file *filp, unsigned int cmd,
 		return -ENOTTY;
 	}
 }
+
 static long virtwl_ioctl_new(struct file *filp, void __user *ptr,
 			     size_t in_size)
 {
@@ -1186,36 +1370,44 @@ static long virtwl_ioctl_new(struct file *filp, void __user *ptr,
 	struct virtwl_ioctl_new ioctl_new = {};
 	size_t size = min(in_size, sizeof(ioctl_new));
 	int ret;
+
 	/* Early check for user error. */
 	ret = !access_ok(ptr, size);
 	if (ret)
 		return -EFAULT;
+
 	ret = copy_from_user(&ioctl_new, ptr, size);
 	if (ret)
 		return -EFAULT;
+
 	vfd = do_new(vi, &ioctl_new, size, filp->f_flags & O_NONBLOCK);
 	if (IS_ERR(vfd))
 		return PTR_ERR(vfd);
+
 	ret = anon_inode_getfd("[virtwl_vfd]", &virtwl_vfd_fops, vfd,
 			       virtwl_vfd_file_flags(vfd) | O_CLOEXEC);
 	if (ret < 0) {
 		do_vfd_close(vfd);
 		return ret;
 	}
+
 	ioctl_new.fd = ret;
 	ret = copy_to_user(ptr, &ioctl_new, size);
 	if (ret) {
 		/* The release operation will handle freeing this alloc */
-		ksys_close(ioctl_new.fd);
+		close_fd(ioctl_new.fd);
 		return -EFAULT;
 	}
+
 	return 0;
 }
+
 static long virtwl_ioctl_ptr(struct file *filp, unsigned int cmd,
 			     void __user *ptr)
 {
 	if (filp->f_op == &virtwl_vfd_fops)
 		return virtwl_vfd_ioctl(filp, cmd, ptr);
+
 	switch (_IOC_NR(cmd)) {
 	case _IOC_NR(VIRTWL_IOCTL_NEW):
 		return virtwl_ioctl_new(filp, ptr, _IOC_SIZE(cmd));
@@ -1223,10 +1415,12 @@ static long virtwl_ioctl_ptr(struct file *filp, unsigned int cmd,
 		return -ENOTTY;
 	}
 }
+
 static long virtwl_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	return virtwl_ioctl_ptr(filp, cmd, (void __user *)arg);
 }
+
 #ifdef CONFIG_COMPAT
 static long virtwl_ioctl_compat(struct file *filp, unsigned int cmd,
 				unsigned long arg)
@@ -1236,16 +1430,19 @@ static long virtwl_ioctl_compat(struct file *filp, unsigned int cmd,
 #else
 #define virtwl_ioctl_compat NULL
 #endif
+
 static int virtwl_release(struct inode *inodep, struct file *filp)
 {
 	return 0;
 }
+
 static const struct file_operations virtwl_fops = {
 	.open = virtwl_open,
 	.unlocked_ioctl = virtwl_ioctl,
 	.compat_ioctl = virtwl_ioctl_compat,
 	.release = virtwl_release,
 };
+
 static const struct file_operations virtwl_vfd_fops = {
 	.read = virtwl_vfd_read,
 	.write = virtwl_vfd_write,
@@ -1255,6 +1452,7 @@ static const struct file_operations virtwl_vfd_fops = {
 	.compat_ioctl = virtwl_ioctl_compat,
 	.release = virtwl_vfd_release,
 };
+
 static int probe_common(struct virtio_device *vdev)
 {
 	int i;
@@ -1262,10 +1460,13 @@ static int probe_common(struct virtio_device *vdev)
 	struct virtwl_info *vi = NULL;
 	vq_callback_t *vq_callbacks[] = { vq_in_cb, vq_out_cb };
 	static const char * const vq_names[] = { "in", "out" };
+
 	vi = kzalloc(sizeof(struct virtwl_info), GFP_KERNEL);
 	if (!vi)
 		return -ENOMEM;
+
 	vdev->priv = vi;
+
 	ret = alloc_chrdev_region(&vi->dev_num, 0, 1, "wl");
 	if (ret) {
 		ret = -ENOMEM;
@@ -1273,18 +1474,22 @@ static int probe_common(struct virtio_device *vdev)
 			ret);
 		goto free_vi;
 	}
+
 	vi->class = class_create(THIS_MODULE, "wl");
 	if (IS_ERR(vi->class)) {
 		ret = PTR_ERR(vi->class);
 		pr_warn("virtwl: failed to create wl class: %d\n", ret);
 		goto unregister_region;
+
 	}
+
 	vi->dev = device_create(vi->class, NULL, vi->dev_num, vi, "wl%d", 0);
 	if (IS_ERR(vi->dev)) {
 		ret = PTR_ERR(vi->dev);
 		pr_warn("virtwl: failed to create wl0 device: %d\n", ret);
 		goto destroy_class;
 	}
+
 	cdev_init(&vi->cdev, &virtwl_fops);
 	ret = cdev_add(&vi->cdev, vi->dev_num, 1);
 	if (ret) {
@@ -1292,8 +1497,10 @@ static int probe_common(struct virtio_device *vdev)
 			ret);
 		goto destroy_device;
 	}
+
 	for (i = 0; i < VIRTWL_QUEUE_COUNT; i++)
 		mutex_init(&vi->vq_locks[i]);
+
 	ret = virtio_find_vqs(vdev, VIRTWL_QUEUE_COUNT, vi->vqs, vq_callbacks,
 			      vq_names, NULL);
 	if (ret) {
@@ -1301,30 +1508,29 @@ static int probe_common(struct virtio_device *vdev)
 			ret);
 		goto del_cdev;
 	}
+
 	INIT_WORK(&vi->in_vq_work, vq_in_work_handler);
 	INIT_WORK(&vi->out_vq_work, vq_out_work_handler);
 	init_waitqueue_head(&vi->out_waitq);
+
 	mutex_init(&vi->vfds_lock);
 	idr_init(&vi->vfds);
+
 	vi->use_send_vfd_v2 = virtio_has_feature(vdev, VIRTIO_WL_F_SEND_FENCES);
-	if (virtio_has_feature(vdev, VIRTIO_WL_F_USE_SHMEM)) {
-		struct virtio_shm_region region;
-		if (!virtio_get_shm_region(vdev, &region, 0)) {
-			pr_warn("virtwl: failed to find shm region");
-			goto del_cdev;
-		}
-		vi->pfn_base = region.addr >> PAGE_SHIFT;
-		vi->invalid_pfn = region.len >> PAGE_SHIFT;
-	}
+
 	/* lock is unneeded as we have unique ownership */
 	ret = vq_fill_locked(vi->vqs[VIRTWL_VQ_IN]);
 	if (ret) {
 		pr_warn("virtwl: failed to fill in virtqueue: %d", ret);
 		goto del_cdev;
 	}
+
 	virtio_device_ready(vdev);
 	virtqueue_kick(vi->vqs[VIRTWL_VQ_IN]);
+
+
 	return 0;
+
 del_cdev:
 	cdev_del(&vi->cdev);
 destroy_device:
@@ -1337,38 +1543,46 @@ free_vi:
 	kfree(vi);
 	return ret;
 }
+
 static void remove_common(struct virtio_device *vdev)
 {
 	struct virtwl_info *vi = vdev->priv;
+
 	cdev_del(&vi->cdev);
 	put_device(vi->dev);
 	class_destroy(vi->class);
 	unregister_chrdev_region(vi->dev_num, 0);
 	kfree(vi);
 }
+
 static int virtwl_probe(struct virtio_device *vdev)
 {
 	return probe_common(vdev);
 }
+
 static void virtwl_remove(struct virtio_device *vdev)
 {
 	remove_common(vdev);
 }
+
 static void virtwl_scan(struct virtio_device *vdev)
 {
 }
+
 static struct virtio_device_id id_table[] = {
 	{ VIRTIO_ID_WL, VIRTIO_DEV_ANY_ID },
 	{ 0 },
 };
+
 static unsigned int features_legacy[] = {
 	VIRTIO_WL_F_TRANS_FLAGS
 };
+
 static unsigned int features[] = {
 	VIRTIO_WL_F_TRANS_FLAGS,
 	VIRTIO_WL_F_SEND_FENCES,
-	VIRTIO_WL_F_USE_SHMEM,
 };
+
 static struct virtio_driver virtio_wl_driver = {
 	.driver.name =	KBUILD_MODNAME,
 	.driver.owner =	THIS_MODULE,
@@ -1381,6 +1595,7 @@ static struct virtio_driver virtio_wl_driver = {
 	.remove =	virtwl_remove,
 	.scan =		virtwl_scan,
 };
+
 module_virtio_driver(virtio_wl_driver);
 MODULE_DEVICE_TABLE(virtio, id_table);
 MODULE_DESCRIPTION("Virtio wayland driver");
