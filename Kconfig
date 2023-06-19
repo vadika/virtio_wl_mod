@@ -1,0 +1,4 @@
+config VIRTIO_WAYLAND
+	bool "VirtIO wayland driver"
+	help
+	  VirtIO wayland driver ported from ChromeOS kernel to mainline
