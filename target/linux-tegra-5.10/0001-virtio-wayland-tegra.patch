@@ -1,7 +1,7 @@
-From 9b5945fd400b451f0e87ebe9610e1a88084e3337 Mon Sep 17 00:00:00 2001
+From afdd31a1a755560ec6e1801e99b700560a45870b Mon Sep 17 00:00:00 2001
 From: Julius Koskela <me@juliuskoskela.dev>
-Date: Wed, 21 Jun 2023 21:44:55 +0300
-Subject: Virtio Wayland Tegra
+Date: Wed, 21 Jun 2023 23:17:04 +0300
+Subject: virtio-wayland-tegra
 
 ---
  drivers/Kconfig            |    4 +

@@ -23,7 +23,7 @@
       }))
 
       {
-        nixosModules.virtio-wayland-tegra = import ./module.nix;
+        nixosModules.virtio-wayland-tegra = import ./target/linux-tegra-5.10/virtio-wayland-tegra.nix;
       }
     ];
 }
